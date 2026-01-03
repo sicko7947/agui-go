@@ -1,16 +1,10 @@
 # agui-go
 
-A Go package for implementing the AG-UI (Agent-User Interaction) protocol for Google's ADK-go, enabling seamless integration between AI agent backends and frontend applications.
+A thin adapter layer for Google's ADK (Agent Development Kit) to the [AG-UI protocol](https://docs.ag-ui.com), built on top of the official [AG-UI Go SDK](https://github.com/ag-ui-protocol/ag-ui/tree/main/sdks/community/go).
 
 ## Overview
 
-AG-UI is a lightweight, event-driven protocol designed for streaming communication between AI agent backends and frontend applications. This package provides:
-
-- **Framework-agnostic core**: Event types, encoders, and converters that work with any agent framework
-- **ADK adapter**: Ready-to-use integration with Google's Agent Development Kit (ADK)
-- **SSE streaming**: Real-time Server-Sent Events support
-- **Full protocol compliance**: All AG-UI event types supported
-- **Reasoning/Thinking support**: Display agent reasoning process via step events or custom events
+This package provides seamless integration between Google ADK agents and AG-UI compatible frontends. It uses the official AG-UI SDK for all event types and SSE encoding, keeping this library minimal and protocol-compliant.
 
 ## Installation
 
@@ -34,10 +28,8 @@ import (
 )
 
 func main() {
-    // Create your ADK agent
     myAgent := createYourAgent()
 
-    // Create AG-UI handler for ADK
     handler, err := aguigo.NewADKHandler(
         myAgent,
         session.InMemoryService(),
@@ -47,54 +39,27 @@ func main() {
         log.Fatal(err)
     }
 
-    // Mount the handler
     http.Handle("/api/ag-ui", handler)
-    
     log.Println("AG-UI server running on :8081")
     http.ListenAndServe(":8081", nil)
 }
 ```
 
-### With Reasoning/Thinking Display
-
-To enable reasoning/thinking display from your ADK agent, use the converter options:
+### With Thinking/Reasoning Display
 
 ```go
-package main
-
-import (
-    "log"
-    "net/http"
-
-    aguigo "github.com/sicko7947/agui-go"
-    "google.golang.org/adk/session"
+handler, err := aguigo.NewADKHandler(
+    myAgent,
+    session.InMemoryService(),
+    "my-app",
+    aguigo.WithStepEvents(true), // Emit STEP_STARTED/STEP_FINISHED for thinking
 )
-
-func main() {
-    myAgent := createYourAgent()
-
-    // Create ADK converter with step events enabled for reasoning
-    conv := aguigo.NewADKConverter("thread-id", "run-id",
-        aguigo.WithStepEvents(true),      // Emit STEP_STARTED/STEP_FINISHED for thinking
-        aguigo.WithActivityEvents(true),  // Emit ACTIVITY_DELTA for progress tracking
-    )
-
-    // The converter will automatically convert ADK's Thought parts to:
-    // - STEP_STARTED/STEP_FINISHED events (when WithStepEvents is true)
-    // - CUSTOM "thinking" events (when WithStepEvents is false)
-    
-    handler, err := aguigo.NewADKHandler(myAgent, session.InMemoryService(), "my-app")
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    http.Handle("/api/ag-ui", handler)
-    http.ListenAndServe(":8081", nil)
-}
 ```
 
 ### Framework-Agnostic Usage
 
+Implement the `EventSource` interface to use with any agent framework:
+
 ```go
 package main
 
@@ -102,53 +67,38 @@ import (
     "net/http"
 
     aguigo "github.com/sicko7947/agui-go"
+    "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 )
 
-// Implement the EventSource interface
 type MyEventSource struct{}
 
-func (s *MyEventSource) Run(ctx aguigo.Context, input aguigo.RunAgentInput) <-chan aguigo.Event {
-    events := make(chan aguigo.Event)
+func (s *MyEventSource) Run(ctx aguigo.HandlerContext, input aguigo.RunAgentInput) <-chan events.Event {
+    ch := make(chan events.Event)
     
     go func() {
-        defer close(events)
-        
-        conv := aguigo.NewBaseConverter(ctx.ThreadID, ctx.RunID)
+        defer close(ch)
         
         // Send run started
-        events <- conv.StartRun()
-        
-        // Optionally show reasoning/thinking step
-        stepID := "thinking-step-1"
-        events <- conv.CreateStepEvent("reasoning", stepID, true)  // Step started
-        events <- conv.CreateActivityEvent(aguigo.Activity{
-            ID:          stepID,
-            Type:        "thinking",
-            Status:      "running",
-            Description: "Analyzing the user's request...",
-        })
-        events <- conv.CreateStepEvent("reasoning", stepID, false) // Step finished
+        ch <- events.NewRunStartedEvent(ctx.ThreadID, ctx.RunID)
         
         // Send a message
-        for _, evt := range conv.StartMessage("assistant") {
-            events <- evt
-        }
-        events <- conv.AddMessageContent("Hello from my agent!")
-        events <- conv.EndMessage()
+        msgID := events.GenerateMessageID()
+        ch <- events.NewTextMessageStartEvent(msgID, events.WithRole("assistant"))
+        ch <- events.NewTextMessageContentEvent(msgID, "Hello from my agent!")
+        ch <- events.NewTextMessageEndEvent(msgID)
         
         // Send run finished
-        for _, evt := range conv.FinishRun() {
-          events <- evt
-        }
+        ch <- events.NewRunFinishedEvent(ctx.ThreadID, ctx.RunID)
     }()
     
-    return events
+    return ch
 }
 
 func main() {
     h := aguigo.New(aguigo.Config{
         EventSource: &MyEventSource{},
         AppName:     "my-app",
+        Logger:      aguigo.StdLogger{},
     })
     
     http.Handle("/api/ag-ui", h)
@@ -158,96 +108,40 @@ func main() {
 
 ## Package Structure
 
-This is a single-package design where all types are in the `aguigo` package:
-
 ```
 github.com/sicko7947/agui-go/
-├── types.go      # AG-UI event type definitions (Event, Base, RunStarted, etc.)
-├── encoder.go    # SSE and JSON encoding utilities
-├── converter.go  # BaseConverter for event conversion
-├── handler.go    # Generic HTTP handler for AG-UI protocol
-├── adapter.go    # Google ADK-specific adapter (ADKConverter, ADKHandler)
-└── doc.go        # Package documentation
+├── adapter.go   # ADKConverter, ADKHandler - Google ADK integration
+├── handler.go   # Generic Handler, EventSource interface, utilities
 ```
 
-## Event Types
-
-### Lifecycle Events
-- `RUN_STARTED` - Agent run initiated
-- `RUN_FINISHED` - Agent run completed
-- `RUN_ERROR` - Error during execution
-
-### Text Message Events
-- `TEXT_MESSAGE_START` - New message begins
-- `TEXT_MESSAGE_CONTENT` - Message content chunk
-- `TEXT_MESSAGE_END` - Message complete
-
-### Tool Call Events
-- `TOOL_CALL_START` - Tool invocation begins
-- `TOOL_CALL_ARGS` - Tool arguments chunk
-- `TOOL_CALL_END` - Tool call complete
-- `TOOL_CALL_RESULT` - Tool execution result
-
-### State Events
-- `STATE_SNAPSHOT` - Full state snapshot
-- `STATE_DELTA` - Incremental state update
-- `MESSAGES_SNAPSHOT` - Message history
-
-### Activity Events
-- `ACTIVITY_SNAPSHOT` - All activities
-- `ACTIVITY_DELTA` - Activity update
-
-### Step Events (for Reasoning/Thinking)
-- `STEP_STARTED` - Processing step begins (can be used for thinking/reasoning)
-- `STEP_FINISHED` - Processing step ends
-
-### Special Events
-- `RAW` - Untyped data passthrough
-- `CUSTOM` - Vendor-specific events (e.g., "thinking" for reasoning display)
-
-## Reasoning/Thinking Support
-
-The package supports displaying agent reasoning in two ways:
-
-### 1. Step Events (Recommended)
-
-When `WithStepEvents(true)` is enabled, thinking content from ADK agents is converted to `STEP_STARTED`/`STEP_FINISHED` events:
-
-```json
-{"type": "STEP_STARTED", "stepName": "agent_thinking", "stepId": "uuid"}
-{"type": "STEP_FINISHED", "stepId": "uuid"}
+All AG-UI event types come from the official SDK:
+```go
+import "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 ```
 
-### 2. Custom Events
+## Converter Options
 
-When step  are disabled, thinking content is emitted as custom events:
-
-```json
-{"type": "CUSTOM", "name": "thinking", "data": {"content": "...", "author": "agent"}}
+```go
+aguigo.NewADKConverter(threadID, runID,
+    aguigo.WithStepEvents(true),     // Emit STEP_* events for thinking/reasoning
+    aguigo.WithActivityEvents(true), // Emit ACTIVITY_DELTA events
+    aguigo.WithRawEvents(true),      // Include original events
+)
 ```
 
-### Frontend Handling
+## ADK Event Conversion
 
-```typescript
-function handleEvent(event: AgUiEvent) {
-  switch (event.type) {
-    case 'STEP_STARTED':
-      if (event.stepName.includes('thinking')) {
-        showThinkingIndicator(event.stepId);
-      }
-      break;
-    case 'STEP_FINISHED':
-      hideThinkingIndicator(event.stepId);
-      break;
-    case 'CUSTOM':
-      if .name === 'thinking') {
-        displayThinkingContent(event.data.content);
-      }
-      break;
-    // ... handle other events
-  }
-}
-```
+The `ADKConverter` handles:
+
+| ADK Event | AG-UI Events |
+|-----------|--------------|
+| Text content | `TEXT_MESSAGE_START` → `TEXT_MESSAGE_CONTENT` → `TEXT_MESSAGE_END` |
+| Function calls | `TOOL_CALL_START` → `TOOL_CALL_ARGS` → `TOOL_CALL_END` |
+| Function responses | `TOOL_CALL_RESULT` |
+| Thought/reasoning | `STEP_STARTED`/`STEP_FINISHED` or `CUSTOM("thinking")` |
+| State delta | `STATE_DELTA` (JSON Patch operations) |
+| Agent transfer | `CUSTOM("agent_transfer")` |
+| Escalation | `CUSTOM("escalation")` |
 
 ## Frontend Integration
 
@@ -261,10 +155,9 @@ import { AssistantRuntimeProvider, Thread } from "@assistant-ui/react";
 function App() {
   const agent = new HttpAgent({
     url: "http://localhost:8081/api/ag-ui",
-    headers: { Accept: "text/event-stream" },
   });
 
-  const runtime = use({ agent });
+  const runtime = useAgUiRuntime({ agent });
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
@@ -277,34 +170,30 @@ function App() {
 ### Manual SSE Connection
 
 ```typescript
-async function streamChat(messages: Message[]) {
-  const response = await fetch("http://localhost:8081/api/ag-ui", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Accept": "text/event-stream",
-    },
-    body: JSON.stringify({
-      threadId: "thread-123",
-      messages: messages,
-    }),
-  });
+const response = await fetch("http://localhost:8081/api/ag-ui", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "Accept": "text/event-stream",
+  },
+  body: JSON.stringify({
+    threadId: "thread-123",
+    messages: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+  }),
+});
 
-  co response.body?.getReader();
-  const decoder = new TextDecoder();
+const reader = response.body?.getReader();
+const decoder = new TextDecoder();
 
-  while (true) {
-    const { done, value } = await reader!.read();
-    if (done) break;
+while (true) {
+  const { done, value } = await reader!.read();
+  if (done) break;
 
-    const chunk = decoder.decode(value);
-    const lines = chunk.split("\n");
-
-    for (const line of lines) {
-      if (line.startsWith("data: ")) {
-        const event = JSON.parse(line.slice(6));
-        handleEvent(event);
-      }
+  const lines = decoder.decode(value).split("\n");
+  for (const line of lines) {
+    if (line.startsWith("data: ")) {
+      const event = JSON.parse(line.slice(6));
+      console.log(event.type, event);
     }
   }
 }
@@ -312,66 +201,46 @@ async function streamChat(messages: Message[]) {
 
 ## API Reference
 
-### Converter Options
+### Types
 
 ```go
-conv := aguigo.NewBaseConverter(threadID, runID,
-    aguigo.WithRawEvents(true),      // Include original events
-    aguigo.WithStepEvents(true),     // Emit STEP_* events for thinking/reasoning
-    aguigo.WithActivityEvents(true), // Emit ACTIVITY_DELTA events
-)
-```
-
-### ADK Handler
-
-```go
-handler, err := aguigo.NewADKHandler(agent, sessionService, appName)
-```
-
-### ADK Converter
-
-```go
-conv := aguigo.NewADKConverter(threadID, runID,
-    aguigo.WithStepEvents(true),
-    aguigo.WithActivityEvents(true),
-)
-
-// Convert ADK events to AG-UI events
-aguiEvents := conv.ConvertEvent(adkEvent)
-```
-
-### Generic Handler
-
-```go
-h := aguigo.New(aguigo.Config{
-    EventSource: myEventSource,
-    AppName:     "my-app",
-    Logger:      aguigo.StdLogger{}, // Optional
-})
-```
-
-### Key Types
-
-```go
-// Event interface - all AG-UI events implement this
-type Event interface {
-    GetType() EventType
-    GetTimestamp() int64
-    ToJSON() ([]byte, error)
+// RunAgentInput - AG-UI protocol input
+type RunAgentInput struct {
+    ThreadID string    `json:"threadId"`
+    RunID    string    `json:"runId,omitempty"`
+    Messages []Message `json:"messages"`
+    Tools    []Tool    `json:"tools,omitempty"`
+    Context  any       `json:"context,omitempty"`
+    State    any       `json:"state,omitempty"`
 }
 
-// EventSource interface - implement this for custom agents
+// EventSource - implement for custom agents
 type EventSource interface {
-    Run(ctx Context, input RunAgentInput) <-chan Event
+    Run(ctx HandlerContext, input RunAgentInput) <-chan events.Event
 }
 
-// Activity for progress tracking
-type Activity struct {
-    ID          string `json:"id"`
-    Type        string `json:"type"`
-    Status      string `json:"status"` // "pending", "running", "completed", "failed"
-    Description string `json:"description,omitempty"`
+// HandlerContext - context for agent runs
+type HandlerContext struct {
+    ThreadID string
+    RunID    string
+    UserID   string
+    Request  *http.Request
 }
+```
+
+### Functions
+
+```go
+// ADK integration
+func NewADKHandler(agent agent.Agent, sessionService session.Service, appName string, opts ...Option) (*ADKHandler, error)
+func NewADKConverter(threadID, runID string, opts ...Option) *ADKConverter
+
+// Generic handler
+func New(config Config) *Handler
+
+// Utilities
+func HealthHandler(w http.ResponseWriter, r *http.Request)
+func CORSMiddleware(next http.Handler) http.Handler
 ```
 
 ## License
