@@ -132,6 +132,10 @@ func (c *ADKConverter) ErrorRun(err error) []events.Event {
 func (c *ADKConverter) ConvertEvent(adkEvent *session.Event) []events.Event {
 	var result []events.Event
 
+	if c.options.IncludeRawEvents {
+		result = append(result, events.NewRawEvent(adkEvent))
+	}
+
 	if adkEvent.Content != nil && len(adkEvent.Content.Parts) > 0 {
 		for _, part := range adkEvent.Content.Parts {
 			// Handle thinking/reasoning (Thought flag on text parts)
@@ -154,6 +158,26 @@ func (c *ADKConverter) ConvertEvent(adkEvent *session.Event) []events.Event {
 			if part.FunctionResponse != nil {
 				result = append(result, c.handleFunctionResponse(part.FunctionResponse)...)
 			}
+
+			// Handle executable code (code generation)
+			if part.ExecutableCode != nil {
+				result = append(result, c.handleExecutableCode(part.ExecutableCode)...)
+			}
+
+			// Handle code execution results
+			if part.CodeExecutionResult != nil {
+				result = append(result, c.handleCodeExecutionResult(part.CodeExecutionResult)...)
+			}
+
+			// Handle inline data (images, files, etc.)
+			if part.InlineData != nil {
+				result = append(result, c.handleInlineData(part.InlineData)...)
+			}
+
+			// Handle file data references
+			if part.FileData != nil {
+				result = append(result, c.handleFileData(part.FileData)...)
+			}
 		}
 	}
 
@@ -167,23 +191,31 @@ func (c *ADKConverter) ConvertEvent(adkEvent *session.Event) []events.Event {
 func (c *ADKConverter) handleThought(adkEvent *session.Event, thought string) []events.Event {
 	var result []events.Event
 
-	if !c.options.EmitStepEvents {
-		// Emit as custom event if step events disabled
-		result = append(result, events.NewCustomEvent(
-			"thinking",
-			events.WithValue(map[string]any{
-				"content": thought,
-				"author":  adkEvent.Author,
-			}),
-		))
+	// Skip empty thoughts
+	if thought == "" {
 		return result
 	}
 
-	// Create a step for the thinking process
-	stepID := events.GenerateStepID()
+	// Emit THINKING_START to begin the thinking phase
+	result = append(result, events.NewThinkingStartEvent())
 
-	result = append(result, events.NewStepStartedEvent(stepID))
-	result = append(result, events.NewStepFinishedEvent(stepID))
+	if c.options.EmitActivityEvents {
+		result = append(result, events.NewActivitySnapshotEvent(c.currentMessageID, events.RoleActivity, map[string]string{
+			"type": "thinking",
+		}))
+	}
+
+	// Emit THINKING_TEXT_MESSAGE_START
+	result = append(result, events.NewThinkingTextMessageStartEvent())
+
+	// Emit THINKING_TEXT_MESSAGE_CONTENT with the actual thought content
+	result = append(result, events.NewThinkingTextMessageContentEvent(thought))
+
+	// Emit THINKING_TEXT_MESSAGE_END
+	result = append(result, events.NewThinkingTextMessageEndEvent())
+
+	// Emit THINKING_END to close the thinking phase
+	result = append(result, events.NewThinkingEndEvent())
 
 	return result
 }
@@ -235,6 +267,13 @@ func (c *ADKConverter) handleFunctionCall(fc *genai.FunctionCall) []events.Event
 
 	// Start tool call
 	result = append(result, events.NewToolCallStartEvent(toolCallID, fc.Name))
+
+	if c.options.EmitActivityEvents {
+		result = append(result, events.NewActivitySnapshotEvent(c.currentMessageID, events.RoleActivity, map[string]string{
+			"type": "tool_call",
+			"name": fc.Name,
+		}))
+	}
 
 	// Emit TOOL_CALL_ARGS with the arguments
 	if fc.Args != nil {
@@ -311,6 +350,13 @@ func (c *ADKConverter) handleActions(actions *session.EventActions) []events.Eve
 				"targetAgent": actions.TransferToAgent,
 			}),
 		))
+
+		if c.options.EmitStepEvents {
+			// Finish current step (agent)
+			result = append(result, events.NewStepFinishedEvent(c.runID))
+			// Start new step (next agent)
+			result = append(result, events.NewStepStartedEvent(actions.TransferToAgent))
+		}
 	}
 
 	// Handle escalation as a custom event
@@ -322,6 +368,87 @@ func (c *ADKConverter) handleActions(actions *session.EventActions) []events.Eve
 			}),
 		))
 	}
+
+	return result
+}
+
+// handleExecutableCode processes executable code parts from ADK
+func (c *ADKConverter) handleExecutableCode(code *genai.ExecutableCode) []events.Event {
+	var result []events.Event
+
+	if code == nil || code.Code == "" {
+		return result
+	}
+
+	// Emit as a custom event with code details
+	result = append(result, events.NewCustomEvent(
+		"executable_code",
+		events.WithValue(map[string]any{
+			"language": string(code.Language),
+			"code":     code.Code,
+		}),
+	))
+
+	return result
+}
+
+// handleCodeExecutionResult processes code execution results from ADK
+func (c *ADKConverter) handleCodeExecutionResult(execResult *genai.CodeExecutionResult) []events.Event {
+	var result []events.Event
+
+	if execResult == nil {
+		return result
+	}
+
+	// Emit as a custom event with execution result
+	result = append(result, events.NewCustomEvent(
+		"code_execution_result",
+		events.WithValue(map[string]any{
+			"outcome": string(execResult.Outcome),
+			"output":  execResult.Output,
+		}),
+	))
+
+	return result
+}
+
+// handleInlineData processes inline binary data (images, files) from ADK
+func (c *ADKConverter) handleInlineData(blob *genai.Blob) []events.Event {
+	var result []events.Event
+
+	if blob == nil {
+		return result
+	}
+
+	// Emit as a custom event with data info (not the actual binary data to avoid bloat)
+	result = append(result, events.NewCustomEvent(
+		"inline_data",
+		events.WithValue(map[string]any{
+			"mimeType": blob.MIMEType,
+			"hasData":  len(blob.Data) > 0,
+			"dataSize": len(blob.Data),
+		}),
+	))
+
+	return result
+}
+
+// handleFileData processes file data references from ADK
+func (c *ADKConverter) handleFileData(fileData *genai.FileData) []events.Event {
+	var result []events.Event
+
+	if fileData == nil {
+		return result
+	}
+
+	// Emit as a custom event with file reference
+	result = append(result, events.NewCustomEvent(
+		"file_data",
+		events.WithValue(map[string]any{
+			"mimeType": fileData.MIMEType,
+			"fileURI":  fileData.FileURI,
+		}),
+	))
 
 	return result
 }
