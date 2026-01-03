@@ -215,13 +215,18 @@ func (c *ADKConverter) handleActions(actions *session.EventActions) []Event {
 
 // ADKHandler handles AG-UI protocol requests for ADK agents
 type ADKHandler struct {
-	runner         *runner.Runner
-	sessionService session.Service
-	appName        string
+	runner          *runner.Runner
+	sessionService  session.Service
+	appName         string
+	converterOpts   []Option
 }
 
-// NewADKHandler creates a new AG-UI handler for an ADK agent
-func NewADKHandler(ag agent.Agent, sessionService session.Service, appName string) (*ADKHandler, error) {
+// NewADKHandler creates a new AG-UI handler for an ADK agent.
+// Optional converter options can be passed to configure event emission behavior:
+//   - WithStepEvents(true) - Emit STEP_STARTED/STEP_FINISHED events for thinking/reasoning
+//   - WithActivityEvents(true) - Emit ACTIVITY_DELTA events for progress tracking
+//   - WithRawEvents(true) - Include original events in output
+func NewADKHandler(ag agent.Agent, sessionService session.Service, appName string, opts ...Option) (*ADKHandler, error) {
 	if appName == "" {
 		appName = "adk-agent"
 	}
@@ -236,9 +241,10 @@ func NewADKHandler(ag agent.Agent, sessionService session.Service, appName strin
 	}
 
 	return &ADKHandler{
-		runner:         r,
-		sessionService: sessionService,
-		appName:        appName,
+		runner:          r,
+		sessionService:  sessionService,
+		appName:         appName,
+		converterOpts:   opts,
 	}, nil
 }
 
@@ -321,7 +327,7 @@ func (h *ADKHandler) handleCORS(w http.ResponseWriter) {
 func (h *ADKHandler) handleSSE(w http.ResponseWriter, ctx context.Context, input RunAgentInput) {
 	SetSSEHeaders(w)
 	enc := NewSSE(w)
-	conv := NewADKConverter(input.ThreadID, input.RunID)
+	conv := NewADKConverter(input.ThreadID, input.RunID, h.converterOpts...)
 
 	// Send RUN_STARTED
 	if err := enc.Encode(conv.StartRun()); err != nil {
@@ -371,7 +377,7 @@ func (h *ADKHandler) handleSSE(w http.ResponseWriter, ctx context.Context, input
 
 // handleJSON handles non-streaming JSON responses
 func (h *ADKHandler) handleJSON(w http.ResponseWriter, ctx context.Context, input RunAgentInput) {
-	conv := NewADKConverter(input.ThreadID, input.RunID)
+	conv := NewADKConverter(input.ThreadID, input.RunID, h.converterOpts...)
 	var allEvents []Event
 
 	// Add RUN_STARTED
